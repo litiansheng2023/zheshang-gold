@@ -13,17 +13,62 @@ jobs:
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
-      - name: Prepare project
+      - uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: debug-keystore-v1
+      - name: Prepare Android project
         run: |
           mkdir -p lib
           if [ -f main.dart ]; then mv main.dart lib/main.dart; fi
           flutter create --platforms=android --project-name zheshang_gold _tmp
           cp -r _tmp/android ./android
           rm -rf _tmp
-          sed -i '0,/<application/s|<application|<uses-permission android:name="android.permission.INTERNET"/>\n    <application|' android/app/src/main/AndroidManifest.xml
+          python3 - <<'PY'
+          import pathlib, os
+
+          mp = pathlib.Path('android/app/src/main/AndroidManifest.xml')
+          s = mp.read_text(encoding='utf-8')
+          perms = '\n    '.join([
+              '<uses-permission android:name="android.permission.INTERNET"/>',
+              '<uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>',
+              '<uses-permission android:name="android.permission.VIBRATE"/>',
+              '<uses-permission android:name="android.permission.WAKE_LOCK"/>',
+              '<uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>',
+              '<uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>',
+              '<uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>',
+          ]) + '\n    '
+          service = '\n        '.join([
+              '<service',
+              '    android:name="com.pravera.flutter_foreground_task.service.ForegroundService"',
+              '    android:foregroundServiceType="specialUse"',
+              '    android:exported="false">',
+              '    <property',
+              '        android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"',
+              '        android:value="realtime gold price monitoring and user-defined price alerts"/>',
+              '</service>',
+          ])
+          assert '<application' in s and '</application>' in s
+          s = s.replace('<application', perms + '<application', 1)
+          s = s.replace('</application>', '    ' + service + '\n    </application>', 1)
+          mp.write_text(s, encoding='utf-8')
+
+          kts = os.path.exists('android/app/build.gradle.kts')
+          gp = pathlib.Path('android/app/build.gradle.kts' if kts else 'android/app/build.gradle')
+          g = gp.read_text(encoding='utf-8')
+          g = g.replace('VERSION_11', 'VERSION_17')
+          if kts:
+              g = g.replace('compileOptions {', 'compileOptions {\n        isCoreLibraryDesugaringEnabled = true', 1)
+              g += '\ndependencies {\n    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")\n}\n'
+          else:
+              g = g.replace('compileOptions {', 'compileOptions {\n        coreLibraryDesugaringEnabled true', 1)
+              g += "\ndependencies {\n    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.4'\n}\n"
+          gp.write_text(g, encoding='utf-8')
+          print('patched', mp, gp)
+          PY
       - run: flutter pub get
       - run: flutter build apk --release
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0.${{ github.run_number }}
+          tag_name: v1.1.${{ github.run_number }}
           files: build/app/outputs/flutter-apk/app-release.apk
