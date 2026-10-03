@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart'
     as fln;
+import 'package:home_widget/home_widget.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -28,6 +29,14 @@ double? _toDouble(dynamic v) =>
     v == null ? null : double.tryParse(v.toString());
 String _two(int n) => n.toString().padLeft(2, '0');
 String _fmt(double v) => v.toStringAsFixed(2);
+
+String _changeText(double? change, String? rate) => [
+      if (change != null) '${change >= 0 ? '+' : ''}${_fmt(change)}',
+      if (rate != null) rate,
+    ].join('   ');
+
+String _pctText(double? r) =>
+    r == null ? '' : '${r >= 0 ? '+' : ''}${r.toStringAsFixed(2)}%';
 
 String _cleanError(Object? e) {
   if (e is TimeoutException) return '请求超时';
@@ -96,6 +105,67 @@ Future<GoldQuote> fetchQuote() async {
 }
 
 // ===================================================================
+// 伦敦金（现货黄金，美元/盎司）：新浪财经行情 hf_XAU（非官方接口）
+// 字段：0 最新价 … 4 最高 5 最低 6 行情时间 7 昨收 8 开盘
+// ===================================================================
+const String _ldnUrl = 'https://hq.sinajs.cn/list=hf_XAU';
+
+class LondonQuote {
+  final double price;
+  final double? change; // 涨跌额（相对昨收）
+  final double? ratePct; // 涨跌幅 %
+  final double? high;
+  final double? low;
+  final String? quoteTime;
+  final String raw;
+
+  LondonQuote(this.price, this.change, this.ratePct, this.high, this.low,
+      this.quoteTime, this.raw);
+}
+
+Future<LondonQuote> fetchLondon() async {
+  final http.Response res = await http.get(
+    Uri.parse(_ldnUrl),
+    headers: {
+      'Referer': 'https://finance.sina.com.cn',
+      'User-Agent': _headers['User-Agent']!,
+    },
+  ).timeout(_timeout);
+  if (res.statusCode != 200) {
+    throw Exception('伦敦金接口 HTTP ${res.statusCode}');
+  }
+  // 返回为 GBK 编码，这里只取数字字段，用 latin1 解码即可
+  final text = latin1.decode(res.bodyBytes);
+  final m = RegExp(r'"([^"]*)"').firstMatch(text);
+  final f = (m?.group(1) ?? '').split(',');
+  if (f.length < 9) throw Exception('伦敦金数据为空或格式异常');
+
+  final price = _toDouble(f[0]);
+  if (price == null || price <= 0) throw Exception('伦敦金价格无法解析');
+
+  double? change;
+  double? ratePct;
+  final prev = _toDouble(f[7]);
+  if (prev != null && prev > 0) {
+    final c = price - prev;
+    final r = c / prev * 100;
+    if (r.abs() < 15) {
+      // 数值明显不合理时不显示涨跌，避免字段对应错误
+      change = c;
+      ratePct = r;
+    }
+  }
+  double? high = _toDouble(f[4]);
+  double? low = _toDouble(f[5]);
+  if (high == null || low == null || high < low) {
+    high = null;
+    low = null;
+  }
+  return LondonQuote(
+      price, change, ratePct, high, low, f[6].trim(), text.trim());
+}
+
+// ===================================================================
 // 后台服务：每秒取价、触发提醒
 // ===================================================================
 @pragma('vm:entry-point')
@@ -109,9 +179,13 @@ class MonitorHandler extends TaskHandler {
   final SharedPreferencesAsync _prefs = SharedPreferencesAsync();
 
   bool _busy = false;
+  bool _busyLdn = false;
   bool _fast = true; // App 在前台：每秒；在后台：每 5 秒
   int _tick = 0;
-  DateTime _lastNotifUpdate = DateTime.fromMillisecondsSinceEpoch(0);
+  DateTime _lastPublish = DateTime.fromMillisecondsSinceEpoch(0);
+
+  GoldQuote? _zs;
+  LondonQuote? _ldn;
 
   bool _upOn = false;
   bool _downOn = false;
@@ -140,15 +214,17 @@ class MonitorHandler extends TaskHandler {
   @override
   void onRepeatEvent(DateTime timestamp) {
     _tick++;
-    if (_busy) return;
-    if (!_fast && _tick % 5 != 0) return;
-    _poll();
+    // 浙商：前台每秒，后台每 5 秒
+    if (!_busy && (_fast || _tick % 5 == 0)) _poll();
+    // 伦敦金：前台每 3 秒，后台每 15 秒
+    if (!_busyLdn && (_tick - 1) % (_fast ? 3 : 15) == 0) _pollLondon();
   }
 
   Future<void> _poll() async {
     _busy = true;
     try {
       final q = await fetchQuote();
+      _zs = q;
       await _checkAlerts(q.price);
 
       FlutterForegroundTask.sendDataToMain({
@@ -159,24 +235,76 @@ class MonitorHandler extends TaskHandler {
         'raw': jsonEncode(q.raw),
       });
 
-      final now = DateTime.now();
-      if (now.difference(_lastNotifUpdate).inSeconds >= 3) {
-        _lastNotifUpdate = now;
-        FlutterForegroundTask.updateService(
-          notificationTitle: '浙商金价 ${_fmt(q.price)} 元/克',
-          notificationText: [
-            if (q.change != null)
-              '${q.change! >= 0 ? '+' : ''}${_fmt(q.change!)}',
-            if (q.rate != null) q.rate!,
-          ].join('   '),
-        );
-      }
+      _publish();
     } catch (e) {
       FlutterForegroundTask.sendDataToMain(
           {'type': 'error', 'msg': _cleanError(e)});
     } finally {
       _busy = false;
     }
+  }
+
+  Future<void> _pollLondon() async {
+    _busyLdn = true;
+    try {
+      final q = await fetchLondon();
+      _ldn = q;
+      FlutterForegroundTask.sendDataToMain({
+        'type': 'ldn',
+        'price': q.price,
+        'change': q.change,
+        'rate': q.ratePct,
+        'high': q.high,
+        'low': q.low,
+        'time': q.quoteTime,
+        'raw': q.raw,
+      });
+      _publish();
+    } catch (e) {
+      FlutterForegroundTask.sendDataToMain(
+          {'type': 'ldnError', 'msg': _cleanError(e)});
+    } finally {
+      _busyLdn = false;
+    }
+  }
+
+  // 更新常驻通知和桌面小组件（最多每 3 秒一次）
+  void _publish() {
+    final now = DateTime.now();
+    if (now.difference(_lastPublish).inSeconds < 3) return;
+    _lastPublish = now;
+    final zs = _zs;
+    final ld = _ldn;
+    FlutterForegroundTask.updateService(
+      notificationTitle:
+          zs == null ? '浙商金价监控中' : '浙商 ${_fmt(zs.price)} 元/克',
+      notificationText: ld == null
+          ? '伦敦金 --'
+          : '伦敦金 ${_fmt(ld.price)}  ${_pctText(ld.ratePct)}',
+    );
+    _updateWidget();
+  }
+
+  Future<void> _updateWidget() async {
+    try {
+      final zs = _zs;
+      final ld = _ldn;
+      final now = DateTime.now();
+      Future<void> put(String k, String v) =>
+          HomeWidget.saveWidgetData<String>(k, v);
+      await put('zs_price', zs == null ? '--' : _fmt(zs.price));
+      await put('zs_change', zs == null ? '' : _changeText(zs.change, zs.rate));
+      await put('zs_flag', zs == null ? '' : ((zs.change ?? 0) >= 0 ? 'up' : 'down'));
+      await put('ld_price', ld == null ? '--' : _fmt(ld.price));
+      await put('ld_change', ld == null ? '' : _changeText(ld.change, null) + (ld.ratePct == null ? '' : '   ${_pctText(ld.ratePct)}'));
+      await put('ld_flag', ld == null ? '' : ((ld.change ?? 0) >= 0 ? 'up' : 'down'));
+      await put('updated',
+          '更新 ${_two(now.hour)}:${_two(now.minute)}:${_two(now.second)}');
+      await HomeWidget.updateWidget(
+        name: 'GoldWidgetProvider',
+        androidName: 'GoldWidgetProvider',
+      );
+    } catch (_) {}
   }
 
   Future<void> _checkAlerts(double p) async {
@@ -212,13 +340,16 @@ class MonitorHandler extends TaskHandler {
         body: body,
         notificationDetails: const fln.NotificationDetails(
           android: fln.AndroidNotificationDetails(
-            'gold_alert',
+            // 渠道设置创建后无法修改，所以换了新的渠道 ID
+            'gold_alert_v2',
             '金价提醒',
             channelDescription: '价格达到你设置的提醒值时通知',
             importance: fln.Importance.max,
             priority: fln.Priority.high,
             playSound: true,
             enableVibration: true,
+            category: fln.AndroidNotificationCategory.alarm,
+            audioAttributesUsage: fln.AudioAttributesUsage.alarm,
           ),
         ),
       );
@@ -288,6 +419,16 @@ class _PricePageState extends State<PricePage> with WidgetsBindingObserver {
   DateTime? _time;
   String? _raw;
   String? _error;
+
+  double? _ldnPrice;
+  double? _ldnChange;
+  double? _ldnRate;
+  double? _ldnHigh;
+  double? _ldnLow;
+  String? _ldnTime;
+  String? _ldnRaw;
+  String? _ldnError;
+  int _bannerSeq = 0;
 
   bool _running = false;
   bool _notifOk = true;
@@ -426,6 +567,19 @@ class _PricePageState extends State<PricePage> with WidgetsBindingObserver {
       });
     } else if (type == 'error') {
       setState(() => _error = data['msg']?.toString());
+    } else if (type == 'ldn') {
+      setState(() {
+        _ldnPrice = _toDouble(data['price']);
+        _ldnChange = _toDouble(data['change']);
+        _ldnRate = _toDouble(data['rate']);
+        _ldnHigh = _toDouble(data['high']);
+        _ldnLow = _toDouble(data['low']);
+        _ldnTime = data['time']?.toString();
+        _ldnRaw = data['raw']?.toString();
+        _ldnError = null;
+      });
+    } else if (type == 'ldnError') {
+      setState(() => _ldnError = data['msg']?.toString());
     } else if (type == 'fired') {
       final up = data['which'] == 'up';
       setState(() {
@@ -436,8 +590,11 @@ class _PricePageState extends State<PricePage> with WidgetsBindingObserver {
         }
       });
       final p = _toDouble(data['price']);
-      _snack('${up ? '涨到' : '跌到'}提醒已触发'
-          '${p == null ? '' : '（当前 ${_fmt(p)}）'}，该提醒已自动关闭');
+      _snack(
+        '${up ? '涨到' : '跌到'}提醒已触发'
+        '${p == null ? '' : '（当前 ${_fmt(p)}）'}，该提醒已自动关闭',
+        sticky: true,
+      );
     }
   }
 
@@ -513,20 +670,56 @@ class _PricePageState extends State<PricePage> with WidgetsBindingObserver {
     }
   }
 
-  void _snack(String msg) {
+  // 应用内提示：显示在页面顶部；sticky 的需要手动点“知道了”关闭
+  void _snack(String msg, {bool sticky = false}) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context)
-      ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(content: Text(msg)));
+    final m = ScaffoldMessenger.of(context);
+    final seq = ++_bannerSeq;
+    m.hideCurrentMaterialBanner();
+    m.showMaterialBanner(
+      MaterialBanner(
+        content: Text(msg),
+        leading: Icon(
+          sticky ? Icons.notifications_active : Icons.info_outline,
+          color: Colors.orange.shade800,
+        ),
+        backgroundColor: Colors.amber.shade100,
+        actions: [
+          TextButton(
+            onPressed: () => m.hideCurrentMaterialBanner(),
+            child: const Text('知道了'),
+          ),
+        ],
+      ),
+    );
+    if (!sticky) {
+      Future.delayed(const Duration(seconds: 3), () {
+        if (mounted && seq == _bannerSeq) m.hideCurrentMaterialBanner();
+      });
+    }
+  }
+
+  Future<void> _addWidget() async {
+    try {
+      await HomeWidget.requestPinWidget(
+        name: 'GoldWidgetProvider',
+        androidName: 'GoldWidgetProvider',
+      );
+      _snack('如果没有弹出添加窗口，请长按桌面空白处 → 小组件 → 浙商金价');
+    } catch (_) {
+      _snack('请长按桌面空白处 → 小组件 → 浙商金价，手动添加');
+    }
   }
 
   void _showRaw() {
-    var text = _raw ?? '还没有收到数据';
+    var zs = _raw ?? '还没有收到数据';
     try {
       if (_raw != null) {
-        text = const JsonEncoder.withIndent('  ').convert(jsonDecode(_raw!));
+        zs = const JsonEncoder.withIndent('  ').convert(jsonDecode(_raw!));
       }
     } catch (_) {}
+    final text = '【浙商接口】\n$zs\n\n【伦敦金接口（新浪 hf_XAU）】\n'
+        '${_ldnRaw ?? '还没有收到数据'}';
     showDialog<void>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -596,6 +789,75 @@ class _PricePageState extends State<PricePage> with WidgetsBindingObserver {
 
   String _two2(int n) => _two(n);
 
+  Widget _londonCard() {
+    final up = (_ldnChange ?? 0) >= 0;
+    final color = up ? Colors.red.shade700 : Colors.green.shade700;
+    final detail = [
+      if (_ldnHigh != null && _ldnLow != null)
+        '最高 ${_fmt(_ldnHigh!)}  最低 ${_fmt(_ldnLow!)}',
+      if (_ldnTime != null && _ldnTime!.isNotEmpty) '行情时间 $_ldnTime',
+    ].join('   ');
+
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('伦敦金（美元/盎司）',
+                style: TextStyle(fontSize: 14, color: Colors.grey)),
+            const SizedBox(height: 8),
+            if (_ldnPrice == null)
+              Text(
+                _ldnError != null ? '获取失败：$_ldnError' : '加载中…',
+                style: TextStyle(
+                  color: _ldnError != null
+                      ? Colors.orange.shade800
+                      : Colors.grey,
+                ),
+              )
+            else ...[
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.baseline,
+                textBaseline: TextBaseline.alphabetic,
+                children: [
+                  Text(
+                    _fmt(_ldnPrice!),
+                    style: TextStyle(
+                      fontSize: 36,
+                      fontWeight: FontWeight.bold,
+                      color: color,
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Text(
+                    [
+                      if (_ldnChange != null)
+                        '${_ldnChange! >= 0 ? '+' : ''}${_fmt(_ldnChange!)}',
+                      if (_ldnRate != null) _pctText(_ldnRate),
+                    ].join('   '),
+                    style: TextStyle(fontSize: 16, color: color),
+                  ),
+                ],
+              ),
+              if (detail.isNotEmpty) ...[
+                const SizedBox(height: 6),
+                Text(detail,
+                    style: const TextStyle(fontSize: 12, color: Colors.grey)),
+              ],
+              if (_ldnError != null) ...[
+                const SizedBox(height: 6),
+                Text('更新失败：$_ldnError',
+                    style:
+                        TextStyle(fontSize: 12, color: Colors.orange.shade800)),
+              ],
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final up = (_change ?? 0) >= 0;
@@ -606,6 +868,11 @@ class _PricePageState extends State<PricePage> with WidgetsBindingObserver {
       appBar: AppBar(
         title: const Text('浙商积存金'),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.widgets_outlined),
+            tooltip: '添加桌面小组件',
+            onPressed: _addWidget,
+          ),
           IconButton(
             icon: const Icon(Icons.info_outline),
             tooltip: '接口原始数据',
@@ -706,10 +973,11 @@ class _PricePageState extends State<PricePage> with WidgetsBindingObserver {
               ),
             ),
           ),
+          _londonCard(),
           const SizedBox(height: 16),
           const Center(
             child: Text(
-              'App 在前台每秒刷新，退到后台每 5 秒刷新\n'
+              'App 在前台：浙商每秒刷新、伦敦金每 3 秒刷新；退到后台会放慢\n'
               '提醒触发一次后会自动关闭，需要时重新打开开关\n'
               '数据来自第三方接口，仅供参考，以银行实际成交价为准',
               textAlign: TextAlign.center,

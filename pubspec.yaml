@@ -1,7 +1,7 @@
 name: zheshang_gold
 description: 浙商积存金实时金价与价格提醒
 publish_to: 'none'
-version: 1.1.0+2
+version: 1.2.0+3
 
 environment:
   sdk: '>=3.0.0 <4.0.0'
@@ -13,6 +13,7 @@ dependencies:
   flutter_foreground_task: ^11.0.3
   flutter_local_notifications: ^22.3.1
   shared_preferences: ^2.5.5
+  home_widget: ^0.9.3
 
 flutter:
   uses-material-design: true
