@@ -180,6 +180,7 @@ class MonitorHandler extends TaskHandler {
 
   bool _busy = false;
   bool _busyLdn = false;
+  DateTime _ldnBackoffUntil = DateTime.fromMillisecondsSinceEpoch(0);
   bool _fast = true; // App 在前台：每秒；在后台：每 5 秒
   int _tick = 0;
   DateTime _lastPublish = DateTime.fromMillisecondsSinceEpoch(0);
@@ -216,8 +217,12 @@ class MonitorHandler extends TaskHandler {
     _tick++;
     // 浙商：前台每秒，后台每 5 秒
     if (!_busy && (_fast || _tick % 5 == 0)) _poll();
-    // 伦敦金：前台每 3 秒，后台每 15 秒
-    if (!_busyLdn && (_tick - 1) % (_fast ? 3 : 15) == 0) _pollLondon();
+    // 伦敦金：前台每秒，后台每 15 秒；失败后退避 5 秒再试
+    if (!_busyLdn &&
+        DateTime.now().isAfter(_ldnBackoffUntil) &&
+        (_fast || (_tick - 1) % 15 == 0)) {
+      _pollLondon();
+    }
   }
 
   Future<void> _poll() async {
@@ -261,6 +266,7 @@ class MonitorHandler extends TaskHandler {
       });
       _publish();
     } catch (e) {
+      _ldnBackoffUntil = DateTime.now().add(const Duration(seconds: 5));
       FlutterForegroundTask.sendDataToMain(
           {'type': 'ldnError', 'msg': _cleanError(e)});
     } finally {
@@ -430,6 +436,9 @@ class _PricePageState extends State<PricePage> with WidgetsBindingObserver {
   String? _ldnError;
   int _bannerSeq = 0;
 
+  // 三个胶囊卡片的顺序（可拖动调整，自动保存）
+  List<String> _order = ['zs', 'ldn', 'alert'];
+
   bool _running = false;
   bool _notifOk = true;
 
@@ -447,6 +456,7 @@ class _PricePageState extends State<PricePage> with WidgetsBindingObserver {
     WidgetsBinding.instance.addObserver(this);
     FlutterForegroundTask.addTaskDataCallback(_onData);
     _loadSettings();
+    _loadOrder();
     _syncTimer =
         Timer.periodic(const Duration(seconds: 2), (_) => _syncRunning());
     WidgetsBinding.instance.addPostFrameCallback((_) => _bootstrap());
@@ -598,6 +608,29 @@ class _PricePageState extends State<PricePage> with WidgetsBindingObserver {
     }
   }
 
+  // ---------- 卡片顺序 ----------
+  Future<void> _loadOrder() async {
+    final saved = await _prefs.getString('card_order');
+    if (saved == null) return;
+    final list = saved.split(',');
+    const valid = {'zs', 'ldn', 'alert'};
+    if (list.length == 3 &&
+        list.toSet().length == 3 &&
+        list.every(valid.contains) &&
+        mounted) {
+      setState(() => _order = list);
+    }
+  }
+
+  void _onReorder(int oldIndex, int newIndex) {
+    setState(() {
+      if (newIndex > oldIndex) newIndex -= 1;
+      final item = _order.removeAt(oldIndex);
+      _order.insert(newIndex, item);
+    });
+    _prefs.setString('card_order', _order.join(','));
+  }
+
   // ---------- 提醒设置 ----------
   Future<void> _loadSettings() async {
     final upOn = await _prefs.getBool('up_on') ?? false;
@@ -735,20 +768,178 @@ class _PricePageState extends State<PricePage> with WidgetsBindingObserver {
 
   // ---------- 界面 ----------
   Widget _banner(String text, {String? actionText, VoidCallback? onAction}) {
-    return Card(
-      color: Colors.orange.shade50,
-      margin: const EdgeInsets.only(bottom: 12),
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(12, 8, 8, 8),
-        child: Row(
-          children: [
-            Icon(Icons.warning_amber_rounded, color: Colors.orange.shade800),
-            const SizedBox(width: 8),
-            Expanded(child: Text(text)),
-            if (actionText != null)
-              TextButton(onPressed: onAction, child: Text(actionText)),
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.fromLTRB(16, 6, 8, 6),
+      decoration: BoxDecoration(
+        color: Colors.orange.shade50,
+        borderRadius: BorderRadius.circular(30),
+      ),
+      child: Row(
+        children: [
+          Icon(Icons.warning_amber_rounded, color: Colors.orange.shade800),
+          const SizedBox(width: 8),
+          Expanded(child: Text(text)),
+          if (actionText != null)
+            TextButton(onPressed: onAction, child: Text(actionText)),
+        ],
+      ),
+    );
+  }
+
+  // 胶囊容器：顶部是标题和拖动手柄
+  Widget _capsule({
+    required Key key,
+    required int index,
+    required String title,
+    required Widget child,
+  }) {
+    final scheme = Theme.of(context).colorScheme;
+    return Container(
+      key: key,
+      margin: const EdgeInsets.symmetric(vertical: 6),
+      padding: const EdgeInsets.fromLTRB(24, 10, 12, 22),
+      decoration: BoxDecoration(
+        color: scheme.surfaceContainerHigh,
+        borderRadius: BorderRadius.circular(36),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  title,
+                  style: TextStyle(fontSize: 14, color: scheme.onSurfaceVariant),
+                ),
+              ),
+              ReorderableDragStartListener(
+                index: index,
+                child: Padding(
+                  padding: const EdgeInsets.all(10),
+                  child: Icon(Icons.drag_indicator, color: scheme.outline),
+                ),
+              ),
+            ],
+          ),
+          child,
+        ],
+      ),
+    );
+  }
+
+  // 涨跌小胶囊
+  Widget _changePill(String text, Color color) {
+    if (text.isEmpty) return const SizedBox.shrink();
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 5),
+      decoration: BoxDecoration(
+        color: color.withAlpha(30),
+        borderRadius: BorderRadius.circular(20),
+      ),
+      child: Text(text, style: TextStyle(fontSize: 16, color: color)),
+    );
+  }
+
+  Widget _zsContent() {
+    final up = (_change ?? 0) >= 0;
+    final color = up ? Colors.red.shade700 : Colors.green.shade700;
+    final t = _time;
+    return SizedBox(
+      width: double.infinity,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (_price == null && _error == null)
+            const Padding(
+              padding: EdgeInsets.all(12),
+              child: CircularProgressIndicator(),
+            ),
+          if (_price != null) ...[
+            Text(
+              _fmt(_price!),
+              style: TextStyle(
+                fontSize: 56,
+                height: 1.1,
+                fontWeight: FontWeight.bold,
+                color: color,
+              ),
+            ),
+            const SizedBox(height: 8),
+            _changePill(_changeText(_change, _rate), color),
+            if (t != null) ...[
+              const SizedBox(height: 10),
+              Text(
+                '更新于 ${_two(t.hour)}:${_two(t.minute)}:${_two(t.second)}',
+                style: const TextStyle(fontSize: 12, color: Colors.grey),
+              ),
+            ],
           ],
-        ),
+          if (_error != null) ...[
+            const SizedBox(height: 8),
+            Text('获取失败：$_error',
+                style: TextStyle(color: Colors.orange.shade800)),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _londonContent() {
+    final up = (_ldnChange ?? 0) >= 0;
+    final color = up ? Colors.red.shade700 : Colors.green.shade700;
+    final detail = [
+      if (_ldnHigh != null && _ldnLow != null)
+        '最高 ${_fmt(_ldnHigh!)}  最低 ${_fmt(_ldnLow!)}',
+      if (_ldnTime != null && _ldnTime!.isNotEmpty) '行情时间 $_ldnTime',
+    ].join('   ');
+    final changeText = [
+      if (_ldnChange != null)
+        '${_ldnChange! >= 0 ? '+' : ''}${_fmt(_ldnChange!)}',
+      if (_ldnRate != null) _pctText(_ldnRate),
+    ].join('   ');
+
+    return SizedBox(
+      width: double.infinity,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (_ldnPrice == null)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 8),
+              child: Text(
+                _ldnError != null ? '获取失败：$_ldnError' : '加载中…',
+                style: TextStyle(
+                  color:
+                      _ldnError != null ? Colors.orange.shade800 : Colors.grey,
+                ),
+              ),
+            )
+          else ...[
+            Text(
+              _fmt(_ldnPrice!),
+              style: TextStyle(
+                fontSize: 44,
+                height: 1.1,
+                fontWeight: FontWeight.bold,
+                color: color,
+              ),
+            ),
+            const SizedBox(height: 8),
+            _changePill(changeText, color),
+            if (detail.isNotEmpty) ...[
+              const SizedBox(height: 10),
+              Text(detail,
+                  style: const TextStyle(fontSize: 12, color: Colors.grey)),
+            ],
+            if (_ldnError != null) ...[
+              const SizedBox(height: 6),
+              Text('更新失败：$_ldnError',
+                  style: TextStyle(fontSize: 12, color: Colors.orange.shade800)),
+            ],
+          ],
+        ],
       ),
     );
   }
@@ -761,7 +952,7 @@ class _PricePageState extends State<PricePage> with WidgetsBindingObserver {
     required VoidCallback onEdit,
   }) {
     return Padding(
-      padding: const EdgeInsets.only(top: 12),
+      padding: const EdgeInsets.only(top: 14),
       child: Row(
         children: [
           Expanded(
@@ -774,8 +965,12 @@ class _PricePageState extends State<PricePage> with WidgetsBindingObserver {
               decoration: InputDecoration(
                 labelText: label,
                 suffixText: '元/克',
-                border: const OutlineInputBorder(),
                 isDense: true,
+                contentPadding:
+                    const EdgeInsets.symmetric(horizontal: 22, vertical: 14),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(30),
+                ),
               ),
               onChanged: (_) => onEdit(),
             ),
@@ -787,86 +982,58 @@ class _PricePageState extends State<PricePage> with WidgetsBindingObserver {
     );
   }
 
-  String _two2(int n) => _two(n);
-
-  Widget _londonCard() {
-    final up = (_ldnChange ?? 0) >= 0;
-    final color = up ? Colors.red.shade700 : Colors.green.shade700;
-    final detail = [
-      if (_ldnHigh != null && _ldnLow != null)
-        '最高 ${_fmt(_ldnHigh!)}  最低 ${_fmt(_ldnLow!)}',
-      if (_ldnTime != null && _ldnTime!.isNotEmpty) '行情时间 $_ldnTime',
-    ].join('   ');
-
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text('伦敦金（美元/盎司）',
-                style: TextStyle(fontSize: 14, color: Colors.grey)),
-            const SizedBox(height: 8),
-            if (_ldnPrice == null)
-              Text(
-                _ldnError != null ? '获取失败：$_ldnError' : '加载中…',
-                style: TextStyle(
-                  color: _ldnError != null
-                      ? Colors.orange.shade800
-                      : Colors.grey,
-                ),
-              )
-            else ...[
-              Row(
-                crossAxisAlignment: CrossAxisAlignment.baseline,
-                textBaseline: TextBaseline.alphabetic,
-                children: [
-                  Text(
-                    _fmt(_ldnPrice!),
-                    style: TextStyle(
-                      fontSize: 36,
-                      fontWeight: FontWeight.bold,
-                      color: color,
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  Text(
-                    [
-                      if (_ldnChange != null)
-                        '${_ldnChange! >= 0 ? '+' : ''}${_fmt(_ldnChange!)}',
-                      if (_ldnRate != null) _pctText(_ldnRate),
-                    ].join('   '),
-                    style: TextStyle(fontSize: 16, color: color),
-                  ),
-                ],
-              ),
-              if (detail.isNotEmpty) ...[
-                const SizedBox(height: 6),
-                Text(detail,
-                    style: const TextStyle(fontSize: 12, color: Colors.grey)),
-              ],
-              if (_ldnError != null) ...[
-                const SizedBox(height: 6),
-                Text('更新失败：$_ldnError',
-                    style:
-                        TextStyle(fontSize: 12, color: Colors.orange.shade800)),
-              ],
-            ],
-          ],
+  Widget _alertContent() {
+    return Column(
+      children: [
+        _alertRow(
+          label: '涨到此价提醒',
+          controller: _upCtl,
+          on: _upOn,
+          onToggle: _toggleUp,
+          onEdit: _onEditUp,
         ),
-      ),
+        _alertRow(
+          label: '跌到此价提醒',
+          controller: _downCtl,
+          on: _downOn,
+          onToggle: _toggleDown,
+          onEdit: _onEditDown,
+        ),
+      ],
     );
+  }
+
+  Widget _buildCard(String id, int index) {
+    switch (id) {
+      case 'zs':
+        return _capsule(
+          key: const ValueKey('zs'),
+          index: index,
+          title: '浙商积存金 · 元/克',
+          child: _zsContent(),
+        );
+      case 'ldn':
+        return _capsule(
+          key: const ValueKey('ldn'),
+          index: index,
+          title: '伦敦金 · 美元/盎司',
+          child: _londonContent(),
+        );
+      default:
+        return _capsule(
+          key: const ValueKey('alert'),
+          index: index,
+          title: '价格提醒',
+          child: _alertContent(),
+        );
+    }
   }
 
   @override
   Widget build(BuildContext context) {
-    final up = (_change ?? 0) >= 0;
-    final color = up ? Colors.red.shade700 : Colors.green.shade700;
-    final t = _time;
-
     return Scaffold(
       appBar: AppBar(
-        title: const Text('浙商积存金'),
+        title: const Text('金价'),
         actions: [
           IconButton(
             icon: const Icon(Icons.widgets_outlined),
@@ -887,103 +1054,41 @@ class _PricePageState extends State<PricePage> with WidgetsBindingObserver {
           ),
         ],
       ),
-      body: ListView(
+      body: ReorderableListView(
         padding: const EdgeInsets.all(16),
-        children: [
-          if (!_notifOk)
-            _banner('通知权限未开启，提醒无法弹出。请在系统设置里允许本应用的通知。'),
-          if (!_running)
-            _banner('后台监控已停止，价格不再更新，提醒也不会触发。',
-                actionText: '开启', onAction: _toggleService),
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.symmetric(vertical: 24, horizontal: 16),
-              child: Column(
-                children: [
-                  const Text('实时金价（元/克）', style: TextStyle(fontSize: 16)),
-                  const SizedBox(height: 12),
-                  if (_price == null && _error == null)
-                    const Padding(
-                      padding: EdgeInsets.all(16),
-                      child: CircularProgressIndicator(),
-                    ),
-                  if (_price != null) ...[
-                    Text(
-                      _fmt(_price!),
-                      style: TextStyle(
-                        fontSize: 64,
-                        fontWeight: FontWeight.bold,
-                        color: color,
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    Text(
-                      [
-                        if (_change != null)
-                          '${_change! >= 0 ? '+' : ''}${_fmt(_change!)}',
-                        if (_rate != null) _rate!,
-                      ].join('   '),
-                      style: TextStyle(fontSize: 20, color: color),
-                    ),
-                    if (t != null) ...[
-                      const SizedBox(height: 12),
-                      Text(
-                        '更新于 ${_two2(t.hour)}:${_two2(t.minute)}:${_two2(t.second)}',
-                        style: const TextStyle(color: Colors.grey),
-                      ),
-                    ],
-                  ],
-                  if (_error != null) ...[
-                    const SizedBox(height: 12),
-                    Text(
-                      '获取失败：$_error',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(color: Colors.orange.shade800),
-                    ),
-                  ],
-                ],
-              ),
-            ),
-          ),
-          const SizedBox(height: 4),
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text('价格提醒',
-                      style:
-                          TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-                  _alertRow(
-                    label: '涨到此价提醒',
-                    controller: _upCtl,
-                    on: _upOn,
-                    onToggle: _toggleUp,
-                    onEdit: _onEditUp,
-                  ),
-                  _alertRow(
-                    label: '跌到此价提醒',
-                    controller: _downCtl,
-                    on: _downOn,
-                    onToggle: _toggleDown,
-                    onEdit: _onEditDown,
-                  ),
-                ],
-              ),
-            ),
-          ),
-          _londonCard(),
-          const SizedBox(height: 16),
-          const Center(
+        buildDefaultDragHandles: false,
+        onReorder: _onReorder,
+        proxyDecorator: (child, index, animation) => Material(
+          color: Colors.transparent,
+          elevation: 8,
+          shadowColor: Colors.black54,
+          borderRadius: BorderRadius.circular(36),
+          child: child,
+        ),
+        header: Column(
+          children: [
+            if (!_notifOk)
+              _banner('通知权限未开启，提醒无法弹出。请在系统设置里允许本应用的通知。'),
+            if (!_running)
+              _banner('后台监控已停止，价格不再更新，提醒也不会触发。',
+                  actionText: '开启', onAction: _toggleService),
+          ],
+        ),
+        footer: const Padding(
+          padding: EdgeInsets.only(top: 16, bottom: 8),
+          child: Center(
             child: Text(
-              'App 在前台：浙商每秒刷新、伦敦金每 3 秒刷新；退到后台会放慢\n'
+              '按住卡片右上角的 ⋮⋮ 图标上下拖动，可调整顺序\n'
+              'App 在前台时浙商、伦敦金都每秒刷新，退到后台会放慢\n'
               '提醒触发一次后会自动关闭，需要时重新打开开关\n'
               '数据来自第三方接口，仅供参考，以银行实际成交价为准',
               textAlign: TextAlign.center,
               style: TextStyle(color: Colors.grey, fontSize: 12),
             ),
           ),
+        ),
+        children: [
+          for (var i = 0; i < _order.length; i++) _buildCard(_order[i], i),
         ],
       ),
     );
