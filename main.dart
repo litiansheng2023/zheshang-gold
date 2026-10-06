@@ -1,6 +1,9 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io' show WebSocket;
+import 'dart:typed_data';
 
+import 'package:encrypt/encrypt.dart' as enc;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
@@ -122,9 +125,12 @@ class LondonQuote {
   final double? low;
   final String? quoteTime;
   final String raw;
+  final double? prevClose; // 昨收（来自新浪，用来计算涨跌）
+  final String source; // 'ws' 京东实时推送 / 'sina' 新浪备用行情
 
   LondonQuote(this.price, this.change, this.ratePct, this.high, this.low,
-      this.quoteTime, this.raw);
+      this.quoteTime, this.raw,
+      {this.prevClose, this.source = 'sina'});
 }
 
 Future<LondonQuote> fetchLondon() async {
@@ -187,7 +193,52 @@ Future<LondonQuote> _fetchLondonFrom(Uri uri) async {
     low = null;
   }
   return LondonQuote(
-      price, change, ratePct, high, low, f[6].trim(), text.trim());
+      price, change, ratePct, high, low, f[6].trim(), text.trim(),
+      prevClose: prev, source: 'sina');
+}
+
+// ===================================================================
+// 伦敦金实时推送：京东金融行情 WebSocket（非官方）
+// 1) 从 getDomainInfo 取加密的服务器列表，AES-256-CBC 解密得到 hq_ws_links
+// 2) 连接后服务器会持续推送 [{"symbol":"GOLD","bid":..,"ask":..}]
+// ===================================================================
+const String _wsDomainApi = 'https://www.jrjr.com/api/getDomainInfo';
+const String _wsFallback =
+    'wss://alb-1ko0lowmvacsqia0ij.cn-shenzhen.alb.aliyuncsslb.com:26203';
+const String _wsKeyB64 = 'JkiBZH1JS2QH2gNpweehCAiUJzOgIwvIqsndqGGgu8E=';
+
+Future<String> fetchWsUrl() async {
+  final res = await _client.get(
+    Uri.parse(_wsDomainApi),
+    headers: {
+      'Accept': 'application/json',
+      'User-Agent': _headers['User-Agent']!,
+    },
+  ).timeout(const Duration(seconds: 5));
+  if (res.statusCode != 200) {
+    throw Exception('获取推送地址失败 HTTP ${res.statusCode}');
+  }
+  final body = jsonDecode(utf8.decode(res.bodyBytes));
+  final enData = body['data']?['en_data'];
+  if (body['code'] != 0 || enData is! String) {
+    throw Exception('推送地址响应格式异常');
+  }
+  final all = base64Decode(enData);
+  if (all.length <= 16) throw Exception('推送地址数据异常');
+  // 前 16 字节是 IV，后面是密文
+  final encrypter = enc.Encrypter(
+    enc.AES(enc.Key(base64Decode(_wsKeyB64)), mode: enc.AESMode.cbc),
+  );
+  final plain = encrypter.decrypt(
+    enc.Encrypted(Uint8List.fromList(all.sublist(16))),
+    iv: enc.IV(Uint8List.fromList(all.sublist(0, 16))),
+  );
+  final cfg = jsonDecode(plain);
+  final links = cfg['hq_ws_links'];
+  if (links is Map && links.isNotEmpty && links.values.first != null) {
+    return links.values.first.toString();
+  }
+  throw Exception('推送地址为空');
 }
 
 // ===================================================================
@@ -212,6 +263,23 @@ class MonitorHandler extends TaskHandler {
 
   GoldQuote? _zs;
   LondonQuote? _ldn;
+
+  // 伦敦金：京东实时推送（主）+ 新浪（昨收/最高最低/备用）
+  WebSocket? _ws;
+  bool _wsConnecting = false;
+  int _wsFail = 0;
+  DateTime _wsNextTry = DateTime.fromMillisecondsSinceEpoch(0);
+  String _wsStatus = '未连接';
+  double? _wsBid;
+  DateTime? _wsAt;
+  String? _wsRaw;
+  LondonQuote? _sinaBase;
+  DateTime _lastLdnSend = DateTime.fromMillisecondsSinceEpoch(0);
+
+  bool get _wsFresh =>
+      _wsBid != null &&
+      _wsAt != null &&
+      DateTime.now().difference(_wsAt!).inSeconds < 10;
 
   bool _upOn = false;
   bool _downOn = false;
@@ -242,12 +310,147 @@ class MonitorHandler extends TaskHandler {
     _tick++;
     // 浙商：前台每秒，后台每 5 秒
     if (!_busy && (_fast || _tick % 5 == 0)) _poll();
-    // 伦敦金：前台每秒，后台每 15 秒；失败后退避 2 秒再试
+    // 伦敦金实时推送：长时间没数据就主动重连；断开时自动重连
+    final at = _wsAt;
+    if (_ws != null &&
+        at != null &&
+        DateTime.now().difference(at).inSeconds > 30) {
+      _ws?.close();
+      _ws = null;
+      _wsAt = null;
+      _wsStatus = '长时间无数据，重连中';
+    }
+    if (_ws == null) _ensureWs();
+    // 新浪行情只用来取昨收/最高最低；推送正常时放慢，推送断开时当备用行情
+    final sinaEvery = _wsFresh ? (_fast ? 15 : 30) : (_fast ? 3 : 15);
     if (!_busyLdn &&
         DateTime.now().isAfter(_ldnBackoffUntil) &&
-        (_fast || (_tick - 1) % 15 == 0)) {
+        (_tick - 1) % sinaEvery == 0) {
       _pollLondon();
     }
+  }
+
+  Future<void> _ensureWs() async {
+    if (_ws != null || _wsConnecting) return;
+    if (DateTime.now().isBefore(_wsNextTry)) return;
+    _wsConnecting = true;
+    try {
+      String url;
+      try {
+        url = await fetchWsUrl();
+      } catch (_) {
+        url = _wsFallback;
+      }
+      final sock =
+          await WebSocket.connect(url).timeout(const Duration(seconds: 8));
+      _ws = sock;
+      _wsFail = 0;
+      _wsStatus = '已连接';
+      sock.listen(
+        _onWsMessage,
+        onDone: () => _onWsClosed(sock),
+        onError: (_) => _onWsClosed(sock),
+        cancelOnError: true,
+      );
+    } catch (e) {
+      _wsFail++;
+      _wsStatus = '连接失败：${_cleanError(e)}';
+      _wsNextTry = DateTime.now()
+          .add(Duration(seconds: _wsFail < 10 ? _wsFail * 3 : 30));
+    } finally {
+      _wsConnecting = false;
+    }
+  }
+
+  void _onWsClosed(WebSocket sock) {
+    if (identical(_ws, sock)) _ws = null;
+    _wsStatus = '已断开，重连中';
+    _wsNextTry = DateTime.now().add(const Duration(seconds: 3));
+  }
+
+  void _onWsMessage(dynamic message) {
+    try {
+      final text =
+          message is String ? message : utf8.decode(message as List<int>);
+      final data = jsonDecode(text);
+      if (data is! List) return;
+      for (final e in data) {
+        if (e is Map && e['symbol'] == 'GOLD') {
+          final bid = _toDouble(e['bid']);
+          if (bid == null || bid <= 0) return;
+          _wsBid = bid; // 使用买入价
+          _wsAt = DateTime.now();
+          _wsRaw = text.length > 500 ? text.substring(0, 500) : text;
+          _onLondonTick();
+          return;
+        }
+      }
+    } catch (_) {}
+  }
+
+  // 合成最新伦敦金：实时价来自推送，涨跌按新浪的昨收计算
+  LondonQuote? _composeLondon() {
+    final base = _sinaBase;
+    final fresh = _wsFresh;
+    if (!fresh && base == null) return null;
+    final price = fresh ? _wsBid! : base!.price;
+    final prev = base?.prevClose;
+    double? change = base?.change;
+    double? rate = base?.ratePct;
+    if (fresh) {
+      change = null;
+      rate = null;
+      if (prev != null && prev > 0) {
+        final c = price - prev;
+        final r = c / prev * 100;
+        if (r.abs() < 15) {
+          change = c;
+          rate = r;
+        }
+      }
+    }
+    double? high = base?.high;
+    double? low = base?.low;
+    if (high != null && low != null) {
+      if (price > high) high = price;
+      if (price < low) low = price;
+    }
+    final at = _wsAt;
+    return LondonQuote(
+      price,
+      change,
+      rate,
+      high,
+      low,
+      fresh && at != null
+          ? '${_two(at.hour)}:${_two(at.minute)}:${_two(at.second)}'
+          : base?.quoteTime,
+      'WS[$_wsStatus]: ${_wsRaw ?? '-'}\nSina: ${base?.raw ?? '-'}',
+      prevClose: prev,
+      source: fresh ? 'ws' : 'sina',
+    );
+  }
+
+  void _onLondonTick() {
+    final q = _composeLondon();
+    if (q == null) return;
+    _ldn = q;
+    final now = DateTime.now();
+    if (now.difference(_lastLdnSend).inMilliseconds >= (_fast ? 250 : 5000)) {
+      _lastLdnSend = now;
+      FlutterForegroundTask.sendDataToMain({
+        'type': 'ldn',
+        'price': q.price,
+        'change': q.change,
+        'rate': q.ratePct,
+        'high': q.high,
+        'low': q.low,
+        'time': q.quoteTime,
+        'raw': q.raw,
+        'source': q.source,
+      });
+    }
+    _publish();
   }
 
   Future<void> _poll() async {
@@ -277,23 +480,14 @@ class MonitorHandler extends TaskHandler {
   Future<void> _pollLondon() async {
     _busyLdn = true;
     try {
-      final q = await fetchLondon();
-      _ldn = q;
-      FlutterForegroundTask.sendDataToMain({
-        'type': 'ldn',
-        'price': q.price,
-        'change': q.change,
-        'rate': q.ratePct,
-        'high': q.high,
-        'low': q.low,
-        'time': q.quoteTime,
-        'raw': q.raw,
-      });
-      _publish();
+      _sinaBase = await fetchLondon();
+      _onLondonTick();
     } catch (e) {
       _ldnBackoffUntil = DateTime.now().add(const Duration(seconds: 2));
-      FlutterForegroundTask.sendDataToMain(
-          {'type': 'ldnError', 'msg': _cleanError(e)});
+      if (!_wsFresh) {
+        FlutterForegroundTask.sendDataToMain(
+            {'type': 'ldnError', 'msg': _cleanError(e)});
+      }
     } finally {
       _busyLdn = false;
     }
@@ -408,7 +602,10 @@ class MonitorHandler extends TaskHandler {
   }
 
   @override
-  Future<void> onDestroy(DateTime timestamp, bool isTimeout) async {}
+  Future<void> onDestroy(DateTime timestamp, bool isTimeout) async {
+    _ws?.close();
+    _ws = null;
+  }
 }
 
 // ===================================================================
@@ -458,6 +655,7 @@ class _PricePageState extends State<PricePage> with WidgetsBindingObserver {
   double? _ldnLow;
   String? _ldnTime;
   DateTime? _ldnLocal;
+  String? _ldnSource;
   String? _ldnRaw;
   String? _ldnError;
   int _bannerSeq = 0;
@@ -612,6 +810,7 @@ class _PricePageState extends State<PricePage> with WidgetsBindingObserver {
         _ldnLow = _toDouble(data['low']);
         _ldnTime = data['time']?.toString();
         _ldnLocal = DateTime.now();
+        _ldnSource = data['source']?.toString();
         _ldnRaw = data['raw']?.toString();
         _ldnError = null;
       });
@@ -918,6 +1117,8 @@ class _PricePageState extends State<PricePage> with WidgetsBindingObserver {
     final color = up ? Colors.red.shade700 : Colors.green.shade700;
     final lt = _ldnLocal;
     final detail = [
+      if (_ldnSource == 'ws') '京东实时推送',
+      if (_ldnSource == 'sina') '备用行情（新浪，较慢）',
       if (lt != null)
         '更新于 ${_two(lt.hour)}:${_two(lt.minute)}:${_two(lt.second)}',
       if (_ldnHigh != null && _ldnLow != null)
