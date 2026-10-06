@@ -25,6 +25,9 @@ const Map<String, String> _headers = {
   'Accept': 'application/json',
 };
 
+// 复用同一个 HTTP 连接（keep-alive），避免每秒一次的请求每次都重新做 TLS 握手
+final http.Client _client = http.Client();
+
 double? _toDouble(dynamic v) =>
     v == null ? null : double.tryParse(v.toString());
 String _two(int n) => n.toString().padLeft(2, '0');
@@ -77,11 +80,11 @@ Future<GoldQuote> fetchQuote() async {
     final usePost = i == 0 ? _preferPost : !_preferPost;
     try {
       final http.Response res = usePost
-          ? await http
+          ? await _client
               .post(Uri.parse(_apiUrl),
                   headers: _headers, body: {'productSku': _sku})
               .timeout(_timeout)
-          : await http
+          : await _client
               .get(Uri.parse('$_apiUrl?productSku=$_sku'), headers: _headers)
               .timeout(_timeout);
       final datas = _extractDatas(res);
@@ -108,7 +111,8 @@ Future<GoldQuote> fetchQuote() async {
 // 伦敦金（现货黄金，美元/盎司）：新浪财经行情 hf_XAU（非官方接口）
 // 字段：0 最新价 … 4 最高 5 最低 6 行情时间 7 昨收 8 开盘
 // ===================================================================
-const String _ldnUrl = 'https://hq.sinajs.cn/list=hf_XAU';
+const Duration _ldnTimeout = Duration(seconds: 2);
+bool _ldnPlainUrl = false; // 记住哪种地址写法可用
 
 class LondonQuote {
   final double price;
@@ -124,13 +128,34 @@ class LondonQuote {
 }
 
 Future<LondonQuote> fetchLondon() async {
-  final http.Response res = await http.get(
-    Uri.parse(_ldnUrl),
+  Object? lastError;
+  for (var i = 0; i < 2; i++) {
+    final plain = i == 0 ? _ldnPlainUrl : !_ldnPlainUrl;
+    try {
+      final uri = plain
+          ? Uri.parse('https://hq.sinajs.cn/list=hf_XAU')
+          // 带时间戳，避免中间缓存导致拿到旧数据
+          : Uri.parse(
+              'https://hq.sinajs.cn/?_=${DateTime.now().millisecondsSinceEpoch}&list=hf_XAU');
+      final q = await _fetchLondonFrom(uri);
+      _ldnPlainUrl = plain;
+      return q;
+    } catch (e) {
+      lastError = e;
+    }
+  }
+  throw Exception(_cleanError(lastError));
+}
+
+Future<LondonQuote> _fetchLondonFrom(Uri uri) async {
+  final http.Response res = await _client.get(
+    uri,
     headers: {
       'Referer': 'https://finance.sina.com.cn',
       'User-Agent': _headers['User-Agent']!,
+      'Cache-Control': 'no-cache',
     },
-  ).timeout(_timeout);
+  ).timeout(_ldnTimeout);
   if (res.statusCode != 200) {
     throw Exception('伦敦金接口 HTTP ${res.statusCode}');
   }
@@ -217,7 +242,7 @@ class MonitorHandler extends TaskHandler {
     _tick++;
     // 浙商：前台每秒，后台每 5 秒
     if (!_busy && (_fast || _tick % 5 == 0)) _poll();
-    // 伦敦金：前台每秒，后台每 15 秒；失败后退避 5 秒再试
+    // 伦敦金：前台每秒，后台每 15 秒；失败后退避 2 秒再试
     if (!_busyLdn &&
         DateTime.now().isAfter(_ldnBackoffUntil) &&
         (_fast || (_tick - 1) % 15 == 0)) {
@@ -266,7 +291,7 @@ class MonitorHandler extends TaskHandler {
       });
       _publish();
     } catch (e) {
-      _ldnBackoffUntil = DateTime.now().add(const Duration(seconds: 5));
+      _ldnBackoffUntil = DateTime.now().add(const Duration(seconds: 2));
       FlutterForegroundTask.sendDataToMain(
           {'type': 'ldnError', 'msg': _cleanError(e)});
     } finally {
@@ -432,6 +457,7 @@ class _PricePageState extends State<PricePage> with WidgetsBindingObserver {
   double? _ldnHigh;
   double? _ldnLow;
   String? _ldnTime;
+  DateTime? _ldnLocal;
   String? _ldnRaw;
   String? _ldnError;
   int _bannerSeq = 0;
@@ -585,6 +611,7 @@ class _PricePageState extends State<PricePage> with WidgetsBindingObserver {
         _ldnHigh = _toDouble(data['high']);
         _ldnLow = _toDouble(data['low']);
         _ldnTime = data['time']?.toString();
+        _ldnLocal = DateTime.now();
         _ldnRaw = data['raw']?.toString();
         _ldnError = null;
       });
@@ -889,7 +916,10 @@ class _PricePageState extends State<PricePage> with WidgetsBindingObserver {
   Widget _londonContent() {
     final up = (_ldnChange ?? 0) >= 0;
     final color = up ? Colors.red.shade700 : Colors.green.shade700;
+    final lt = _ldnLocal;
     final detail = [
+      if (lt != null)
+        '更新于 ${_two(lt.hour)}:${_two(lt.minute)}:${_two(lt.second)}',
       if (_ldnHigh != null && _ldnLow != null)
         '最高 ${_fmt(_ldnHigh!)}  最低 ${_fmt(_ldnLow!)}',
       if (_ldnTime != null && _ldnTime!.isNotEmpty) '行情时间 $_ldnTime',
