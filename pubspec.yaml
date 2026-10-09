@@ -1,7 +1,7 @@
 name: zheshang_gold
 description: 浙商积存金实时金价与价格提醒
 publish_to: 'none'
-version: 1.3.0+4
+version: 1.4.0+5
 
 environment:
   sdk: '>=3.0.0 <4.0.0'

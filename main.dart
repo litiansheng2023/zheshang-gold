@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io' show WebSocket;
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:encrypt/encrypt.dart' as enc;
@@ -244,6 +245,145 @@ Future<String> fetchWsUrl() async {
 // ===================================================================
 // 后台服务：每秒取价、触发提醒
 // ===================================================================
+// ===================================================================
+// 支撑 / 阻力（统计估算，不是预测）
+// 思路：在所选时间窗口内，把价格分成 40 档，综合两项指标给每一档打分——
+//   1) 价格在该档停留的时间（成交密集区，类似“筹码分布”）
+//   2) 反复在该档附近见顶/见底的次数（越新的权重越大），区间最高/最低额外加分
+// 现价上方得分最高的一档 = 最强阻力，下方得分最高的一档 = 最强支撑
+// ===================================================================
+Map<String, dynamic> computeSr(
+    List<int> ts, List<double> px, int windowMin, double price) {
+  final res = <String, dynamic>{'minutes': windowMin, 'ok': false, 'have': 0};
+  if (ts.isEmpty) return res;
+  final from = ts.last - windowMin * 60;
+  var start = 0;
+  while (start < ts.length && ts[start] < from) {
+    start++;
+  }
+  final n = ts.length - start;
+  if (n < 2) return res;
+  final haveSec = ts.last - ts[start];
+  res['have'] = haveSec ~/ 60;
+  if (n < 20 || haveSec < 180) return res; // 至少 3 分钟数据
+
+  var hi = px[start];
+  var lo = px[start];
+  for (var i = start; i < ts.length; i++) {
+    if (px[i] > hi) hi = px[i];
+    if (px[i] < lo) lo = px[i];
+  }
+  res['hi'] = hi;
+  res['lo'] = lo;
+  res['ok'] = true;
+  final range = hi - lo;
+  if (range < 0.02) {
+    res['flat'] = true; // 这段时间价格几乎没动
+    return res;
+  }
+
+  const bins = 40;
+  final bw = range / bins;
+  int binOf(double v) {
+    final b = ((v - lo) / bw).floor();
+    return b < 0 ? 0 : (b >= bins ? bins - 1 : b);
+  }
+
+  // 1) 停留时间密度
+  final dens = List<double>.filled(bins, 0);
+  final sum = List<double>.filled(bins, 0);
+  for (var i = start; i < ts.length; i++) {
+    final b = binOf(px[i]);
+    dens[b] += 1;
+    sum[b] += px[i];
+  }
+  final sm = List<double>.filled(bins, 0);
+  for (var b = 0; b < bins; b++) {
+    var v = dens[b] * 2;
+    var w = 2.0;
+    if (b > 0) {
+      v += dens[b - 1];
+      w += 1;
+    }
+    if (b < bins - 1) {
+      v += dens[b + 1];
+      w += 1;
+    }
+    sm[b] = v / w;
+  }
+  final maxD = sm.reduce(math.max);
+
+  // 2) 摆动高点 / 低点（把窗口切成若干段，找比前后各两段都高/低的点）
+  var seg = haveSec ~/ 30;
+  if (seg < 6) seg = 6;
+  if (seg > 48) seg = 48;
+  final segHi = List<double>.filled(seg, double.negativeInfinity);
+  final segLo = List<double>.filled(seg, double.infinity);
+  for (var i = start; i < ts.length; i++) {
+    var k = ((ts[i] - ts[start]) * seg) ~/ (haveSec + 1);
+    if (k >= seg) k = seg - 1;
+    if (px[i] > segHi[k]) segHi[k] = px[i];
+    if (px[i] < segLo[k]) segLo[k] = px[i];
+  }
+  final touch = List<double>.filled(bins, 0);
+  for (var k = 2; k < seg - 2; k++) {
+    if (segHi[k].isInfinite || segLo[k].isInfinite) continue;
+    final rec = 0.5 + 0.5 * k / seg; // 越新权重越大
+    var isHigh = true;
+    var isLow = true;
+    for (final j in const [-2, -1, 1, 2]) {
+      if (segHi[k + j] > segHi[k]) isHigh = false;
+      if (segLo[k + j] < segLo[k]) isLow = false;
+    }
+    if (isHigh) touch[binOf(segHi[k])] += rec;
+    if (isLow) touch[binOf(segLo[k])] += rec;
+  }
+
+  final hiBin = binOf(hi);
+  final loBin = binOf(lo);
+  final score = List<double>.filled(bins, 0);
+  for (var b = 0; b < bins; b++) {
+    score[b] = touch[b] + 2.0 * (maxD > 0 ? sm[b] / maxD : 0);
+  }
+  score[hiBin] += 1.0; // 区间最高/最低本身就是天然的阻力/支撑
+  score[loBin] += 1.0;
+  final maxS = score.reduce(math.max);
+
+  double levelOf(int b) {
+    if (b == hiBin) return hi;
+    if (b == loBin) return lo;
+    return dens[b] > 0 ? sum[b] / dens[b] : lo + (b + 0.5) * bw;
+  }
+
+  bool better(int b, int? cur, bool up) {
+    if (cur == null) return true;
+    final d = score[b] - score[cur];
+    if (d.abs() > 1e-9) return d > 0;
+    return up ? levelOf(b) < levelOf(cur) : levelOf(b) > levelOf(cur);
+  }
+
+  int? bestUp;
+  int? bestDn;
+  for (var b = 0; b < bins; b++) {
+    if (score[b] < 0.3) continue;
+    final lv = levelOf(b);
+    if (lv > price + bw * 0.5) {
+      if (better(b, bestUp, true)) bestUp = b;
+    } else if (lv < price - bw * 0.5) {
+      if (better(b, bestDn, false)) bestDn = b;
+    }
+  }
+  if (bestUp != null) {
+    res['res'] = levelOf(bestUp);
+    res['resStr'] = score[bestUp] / maxS;
+  }
+  if (bestDn != null) {
+    res['sup'] = levelOf(bestDn);
+    res['supStr'] = score[bestDn] / maxS;
+  }
+  return res;
+}
+
 @pragma('vm:entry-point')
 void startCallback() {
   FlutterForegroundTask.setTaskHandler(MonitorHandler());
@@ -263,6 +403,14 @@ class MonitorHandler extends TaskHandler {
 
   GoldQuote? _zs;
   LondonQuote? _ldn;
+
+  // 浙商价格历史（每 5 秒采样一次，保留约 13 小时），用于计算支撑/阻力
+  final List<int> _hTs = [];
+  final List<double> _hPx = [];
+  DateTime _lastSample = DateTime.fromMillisecondsSinceEpoch(0);
+  DateTime _lastHistSave = DateTime.fromMillisecondsSinceEpoch(0);
+  DateTime _lastSrCalc = DateTime.fromMillisecondsSinceEpoch(0);
+  bool _histDirty = false;
 
   // 伦敦金：京东实时推送（主）+ 新浪（昨收/最高最低/备用）
   WebSocket? _ws;
@@ -296,6 +444,74 @@ class MonitorHandler extends TaskHandler {
       );
     } catch (_) {}
     await _loadSettings();
+    await _loadHistory();
+  }
+
+  Future<void> _loadHistory() async {
+    try {
+      final raw = await _prefs.getString('hist');
+      if (raw == null || raw.isEmpty) return;
+      final cutoff = DateTime.now().millisecondsSinceEpoch ~/ 1000 - 13 * 3600;
+      for (final item in raw.split(';')) {
+        final i = item.indexOf(',');
+        if (i <= 0) continue;
+        final t = int.tryParse(item.substring(0, i));
+        final p = double.tryParse(item.substring(i + 1));
+        if (t == null || p == null || t < cutoff) continue;
+        if (_hTs.isNotEmpty && t <= _hTs.last) continue;
+        _hTs.add(t);
+        _hPx.add(p);
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _saveHistory() async {
+    _lastHistSave = DateTime.now();
+    if (!_histDirty) return;
+    _histDirty = false;
+    try {
+      final sb = StringBuffer();
+      for (var i = 0; i < _hTs.length; i++) {
+        if (i > 0) sb.write(';');
+        sb.write(_hTs[i]);
+        sb.write(',');
+        sb.write(_hPx[i].toStringAsFixed(2));
+      }
+      await _prefs.setString('hist', sb.toString());
+    } catch (_) {}
+  }
+
+  void _recordSample(double p) {
+    final now = DateTime.now();
+    if (now.difference(_lastSample).inSeconds < 5) return;
+    _lastSample = now;
+    final t = now.millisecondsSinceEpoch ~/ 1000;
+    // 中间断了超过 15 分钟（服务被关/手机休眠），旧数据不连续，丢弃重新积累
+    if (_hTs.isNotEmpty && t - _hTs.last > 15 * 60) {
+      _hTs.clear();
+      _hPx.clear();
+    }
+    _hTs.add(t);
+    _hPx.add(p);
+    final cutoff = t - 13 * 3600;
+    var k = 0;
+    while (k < _hTs.length && _hTs[k] < cutoff) {
+      k++;
+    }
+    if (k > 0) {
+      _hTs.removeRange(0, k);
+      _hPx.removeRange(0, k);
+    }
+    _histDirty = true;
+    if (now.difference(_lastHistSave).inSeconds >= 120) _saveHistory();
+    if (_fast && now.difference(_lastSrCalc).inSeconds >= 5) {
+      _lastSrCalc = now;
+      final out = [
+        for (final m in const [30, 60, 240, 720]) computeSr(_hTs, _hPx, m, p),
+      ];
+      FlutterForegroundTask.sendDataToMain(
+          {'type': 'sr', 'json': jsonEncode(out)});
+    }
   }
 
   Future<void> _loadSettings() async {
@@ -458,6 +674,7 @@ class MonitorHandler extends TaskHandler {
     try {
       final q = await fetchQuote();
       _zs = q;
+      _recordSample(q.price);
       await _checkAlerts(q.price);
 
       FlutterForegroundTask.sendDataToMain({
@@ -605,6 +822,7 @@ class MonitorHandler extends TaskHandler {
   Future<void> onDestroy(DateTime timestamp, bool isTimeout) async {
     _ws?.close();
     _ws = null;
+    await _saveHistory();
   }
 }
 
@@ -661,7 +879,12 @@ class _PricePageState extends State<PricePage> with WidgetsBindingObserver {
   int _bannerSeq = 0;
 
   // 三个胶囊卡片的顺序（可拖动调整，自动保存）
-  List<String> _order = ['zs', 'ldn', 'alert'];
+  List<String> _order = ['zs', 'ldn', 'sr', 'alert'];
+
+  static const List<int> _srMinutes = [30, 60, 240, 720];
+  static const List<String> _srNames = ['30分钟', '1小时', '4小时', '半天'];
+  List<Map<String, dynamic>> _sr = [];
+  int _srIdx = 1;
 
   bool _running = false;
   bool _notifOk = true;
@@ -814,6 +1037,12 @@ class _PricePageState extends State<PricePage> with WidgetsBindingObserver {
         _ldnRaw = data['raw']?.toString();
         _ldnError = null;
       });
+    } else if (type == 'sr') {
+      try {
+        final list = jsonDecode(data['json'].toString()) as List;
+        setState(() => _sr =
+            list.map((e) => Map<String, dynamic>.from(e as Map)).toList());
+      } catch (_) {}
     } else if (type == 'ldnError') {
       setState(() => _ldnError = data['msg']?.toString());
     } else if (type == 'fired') {
@@ -837,15 +1066,26 @@ class _PricePageState extends State<PricePage> with WidgetsBindingObserver {
   // ---------- 卡片顺序 ----------
   Future<void> _loadOrder() async {
     final saved = await _prefs.getString('card_order');
-    if (saved == null) return;
-    final list = saved.split(',');
-    const valid = {'zs', 'ldn', 'alert'};
-    if (list.length == 3 &&
-        list.toSet().length == 3 &&
-        list.every(valid.contains) &&
-        mounted) {
-      setState(() => _order = list);
-    }
+    final idx = await _prefs.getInt('sr_idx');
+    if (!mounted) return;
+    setState(() {
+      if (idx != null && idx >= 0 && idx < _srMinutes.length) _srIdx = idx;
+      if (saved != null) {
+        const valid = ['zs', 'ldn', 'sr', 'alert'];
+        final seen = <String>{};
+        final list =
+            saved.split(',').where((e) => valid.contains(e) && seen.add(e)).toList();
+        // 旧版本保存的顺序里没有“支撑/阻力”：放到伦敦金后面
+        if (!list.contains('sr')) {
+          final i = list.indexOf('ldn');
+          list.insert(i >= 0 ? i + 1 : list.length, 'sr');
+        }
+        for (final v in valid) {
+          if (!list.contains(v)) list.add(v);
+        }
+        _order = list;
+      }
+    });
   }
 
   void _onReorder(int oldIndex, int newIndex) {
@@ -1213,6 +1453,149 @@ class _PricePageState extends State<PricePage> with WidgetsBindingObserver {
     );
   }
 
+  Widget _levelBlock(String label, double? level, double? strength, Color color) {
+    final grey = Theme.of(context).colorScheme.onSurfaceVariant;
+    if (level == null) {
+      return Padding(
+        padding: const EdgeInsets.only(top: 10),
+        child: Text('$label：现价已在区间边缘，这一侧暂无明显的位置',
+            style: TextStyle(fontSize: 13, color: grey)),
+      );
+    }
+    final cur = _price;
+    final diff = cur == null ? null : level - cur;
+    final pct = (cur == null || cur == 0 || diff == null) ? null : diff / cur * 100;
+    final str = strength == null
+        ? ''
+        : (strength >= 0.8 ? '强' : (strength >= 0.5 ? '中' : '弱'));
+    return Padding(
+      padding: const EdgeInsets.only(top: 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Text(label, style: TextStyle(fontSize: 14, color: grey)),
+              const SizedBox(width: 8),
+              if (str.isNotEmpty) _changePill('强度 $str', color),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              Text(
+                _fmt(level),
+                style: TextStyle(
+                    fontSize: 32,
+                    height: 1.1,
+                    fontWeight: FontWeight.bold,
+                    color: color),
+              ),
+              const Spacer(),
+              if (diff != null)
+                Text(
+                  '距现价 ${diff >= 0 ? '+' : ''}${_fmt(diff)}'
+                  '${pct == null ? '' : '（${_pctText(pct)}）'}',
+                  style: TextStyle(fontSize: 12, color: grey),
+                ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _srContent() {
+    final grey = Theme.of(context).colorScheme.onSurfaceVariant;
+    final d = _srIdx < _sr.length ? _sr[_srIdx] : null;
+    final win = _srMinutes[_srIdx];
+    final have = (d?['have'] as num?)?.toInt() ?? 0;
+
+    final List<Widget> body;
+    if (d == null || d['ok'] != true) {
+      body = [
+        Text(
+          '数据积累中：已记录 $have 分钟，至少需要 3 分钟才能计算。\n'
+          '价格历史只在 App 后台监控运行期间记录，要看“半天”的结果，需要先持续运行半天。',
+          style: TextStyle(fontSize: 13, color: grey),
+        ),
+      ];
+    } else if (d['flat'] == true) {
+      body = [
+        Text('这段时间价格几乎没有波动，没有可参考的支撑/阻力。',
+            style: TextStyle(fontSize: 13, color: grey)),
+      ];
+    } else {
+      final res = (d['res'] as num?)?.toDouble();
+      final sup = (d['sup'] as num?)?.toDouble();
+      final cur = _price;
+      body = [
+        _levelBlock('最强阻力位', res, (d['resStr'] as num?)?.toDouble(),
+            Colors.red.shade700),
+        _levelBlock('最强支撑位', sup, (d['supStr'] as num?)?.toDouble(),
+            Colors.green.shade700),
+        if (res != null && sup != null && cur != null && res > sup) ...[
+          const SizedBox(height: 14),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(8),
+            child: LinearProgressIndicator(
+              value: ((cur - sup) / (res - sup)).clamp(0.0, 1.0),
+              minHeight: 8,
+            ),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            '现价位于 ${_fmt(sup)} ~ ${_fmt(res)} 区间的 '
+            '${(((cur - sup) / (res - sup)).clamp(0.0, 1.0) * 100).round()}% 位置',
+            style: TextStyle(fontSize: 12, color: grey),
+          ),
+        ],
+        const SizedBox(height: 8),
+        Text(
+          '区间最高 ${_fmt((d['hi'] as num).toDouble())}   '
+          '最低 ${_fmt((d['lo'] as num).toDouble())}'
+          '${have < win * 0.9 ? '\n已记录 $have 分钟，不足 $win 分钟，结果仅供参考' : ''}',
+          style: TextStyle(fontSize: 12, color: grey),
+        ),
+      ];
+    }
+
+    return SizedBox(
+      width: double.infinity,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const SizedBox(height: 4),
+          Wrap(
+            spacing: 8,
+            runSpacing: 4,
+            children: [
+              for (var i = 0; i < _srNames.length; i++)
+                ChoiceChip(
+                  label: Text(_srNames[i]),
+                  selected: _srIdx == i,
+                  showCheckmark: false,
+                  shape: const StadiumBorder(),
+                  onSelected: (_) {
+                    setState(() => _srIdx = i);
+                    _prefs.setInt('sr_idx', i);
+                  },
+                ),
+            ],
+          ),
+          ...body,
+          const SizedBox(height: 10),
+          Text(
+            '按本机记录的浙商价格统计：价格停留的密集区 + 反复见顶/见底的位置。'
+            '这是统计参考，不是预测，也不构成投资建议。',
+            style: TextStyle(fontSize: 11, color: grey),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _alertContent() {
     return Column(
       children: [
@@ -1249,6 +1632,13 @@ class _PricePageState extends State<PricePage> with WidgetsBindingObserver {
           index: index,
           title: '伦敦金 · 美元/盎司',
           child: _londonContent(),
+        );
+      case 'sr':
+        return _capsule(
+          key: const ValueKey('sr'),
+          index: index,
+          title: '支撑 / 阻力 · 浙商 · 元/克',
+          child: _srContent(),
         );
       default:
         return _capsule(
