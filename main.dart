@@ -849,6 +849,381 @@ class MonitorHandler extends TaskHandler {
 // ===================================================================
 // 界面
 // ===================================================================
+// ===================================================================
+// 支撑 / 阻力：数据模型 + 单独页面（样式参考京东金融“黄金盯盘”）
+// 上方价位（阻力）用绿色，下方价位（支撑）用红色
+// ===================================================================
+const List<int> _srMinutes = [30, 60, 240, 720];
+const List<String> _srNames = ['30分钟', '1小时', '4小时', '半天'];
+const Color _srGreen = Color(0xFF3FB58F);
+const Color _srRed = Color(0xFFFF4D4F);
+
+class SrModel extends ChangeNotifier {
+  List<Map<String, dynamic>> data = [];
+  DateTime? at;
+  int idx = 1;
+  double? price;
+
+  Map<String, dynamic>? get current => idx < data.length ? data[idx] : null;
+
+  void setData(List<Map<String, dynamic>> v) {
+    data = v;
+    at = DateTime.now();
+    notifyListeners();
+  }
+
+  void setIdx(int i) {
+    idx = i;
+    notifyListeners();
+  }
+
+  void setPrice(double? p) {
+    price = p;
+    notifyListeners();
+  }
+}
+
+class SrPage extends StatelessWidget {
+  final SrModel model;
+  final SharedPreferencesAsync prefs;
+  const SrPage({super.key, required this.model, required this.prefs});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('支撑 / 阻力 · 浙商')),
+      body: ListenableBuilder(
+        listenable: model,
+        builder: (context, _) => ListView(
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
+          children: [_content(context)],
+        ),
+      ),
+    );
+  }
+
+  Widget _tabs() {
+    return Row(
+      children: [
+        for (var i = 0; i < _srNames.length; i++)
+          Expanded(
+            child: Padding(
+              padding: EdgeInsets.only(right: i < _srNames.length - 1 ? 8 : 0),
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: () {
+                  model.setIdx(i);
+                  prefs.setInt('sr_idx', i);
+                },
+                child: Container(
+                  height: 38,
+                  alignment: Alignment.center,
+                  decoration: BoxDecoration(
+                    color: model.idx == i
+                        ? const Color(0xFFFDEEDB)
+                        : const Color(0xFFF1F2F6),
+                    borderRadius: BorderRadius.circular(22),
+                  ),
+                  child: Text(
+                    _srNames[i],
+                    style: TextStyle(
+                      fontSize: 14,
+                      fontWeight:
+                          model.idx == i ? FontWeight.w600 : FontWeight.normal,
+                      color: model.idx == i
+                          ? const Color(0xFFD9822B)
+                          : const Color(0xFF555A66),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _summary(BuildContext context, double? res, double? sup) {
+    final scheme = Theme.of(context).colorScheme;
+    final cur = model.price;
+    String dist(double? v) {
+      if (v == null || cur == null || cur == 0) return '--';
+      final d = v - cur;
+      return '${d >= 0 ? '+' : ''}${_fmt(d)}（${_pctText(d / cur * 100)}）';
+    }
+
+    Widget line(String label, double? v, Color c, String tail, String none) {
+      return Text.rich(
+        TextSpan(
+          children: v == null
+              ? [TextSpan(text: '$label：$none')]
+              : [
+                  TextSpan(text: '$label：'),
+                  TextSpan(
+                    text: _fmt(v),
+                    style: TextStyle(color: c, fontWeight: FontWeight.w600),
+                  ),
+                  TextSpan(text: '，$tail'),
+                ],
+        ),
+        style: const TextStyle(fontSize: 14, height: 1.6),
+      );
+    }
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+      decoration: BoxDecoration(
+        color: scheme.surface,
+        borderRadius: BorderRadius.circular(18),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          line('最强阻力位', res, _srGreen, '上涨至该价位将明显受阻', '现价已在区间上沿，暂无明显阻力'),
+          line('最强支撑位', sup, _srRed, '下跌至此将获得较强支撑', '现价已在区间下沿，暂无明显支撑'),
+          if (res != null || sup != null) ...[
+            const SizedBox(height: 4),
+            Text(
+              '距现价：阻力 ${dist(res)}   支撑 ${dist(sup)}',
+              style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _priceRow(BuildContext context, double cur) {
+    final scheme = Theme.of(context).colorScheme;
+    return SizedBox(
+      height: 24,
+      child: Row(
+        children: [
+          SizedBox(
+            width: 60,
+            child: Text(
+              _fmt(cur),
+              style: TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.bold,
+                  color: scheme.onSurface),
+            ),
+          ),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Container(
+                height: 1.2, color: scheme.onSurface.withValues(alpha: 0.6)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _tag(String text, double arrowAlign, double w) {
+    const dark = Color(0xFF3A3B3F);
+    return SizedBox(
+      width: w,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            height: 24,
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              color: dark,
+              borderRadius: BorderRadius.circular(6),
+            ),
+            child: Text(text,
+                style: const TextStyle(color: Colors.white, fontSize: 12)),
+          ),
+          Align(
+            alignment: Alignment(arrowAlign, 0),
+            child: const CustomPaint(
+              size: Size(12, 6),
+              painter: _TrianglePainter(dark),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _barRow(
+    BuildContext context, {
+    required double level,
+    required double frac,
+    required bool above,
+    String? tag,
+  }) {
+    const rowH = 22.0;
+    const labelW = 60.0;
+    const tagW = 84.0;
+    final grey = Theme.of(context).colorScheme.onSurfaceVariant;
+    final base = above ? _srGreen : _srRed;
+    final f = frac.clamp(0.0, 1.0).toDouble();
+    return SizedBox(
+      height: rowH,
+      child: LayoutBuilder(
+        builder: (context, c) {
+          final total = c.maxWidth;
+          final barW = total - labelW - 6;
+          final x = labelW + 6 + barW * f;
+          final tagLeft = (x - tagW / 2).clamp(0.0, total - tagW).toDouble();
+          final arrowAlign =
+              (((x - tagLeft) / tagW) * 2 - 1).clamp(-0.85, 0.85).toDouble();
+          return Stack(
+            clipBehavior: Clip.none,
+            children: [
+              Positioned.fill(
+                child: Row(
+                  children: [
+                    SizedBox(
+                      width: labelW,
+                      child: Text(_fmt(level),
+                          style: TextStyle(fontSize: 12.5, color: grey)),
+                    ),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: f < 0.04
+                          ? const SizedBox.shrink()
+                          : Align(
+                              alignment: Alignment.centerLeft,
+                              child: FractionallySizedBox(
+                                widthFactor: f,
+                                child: Container(
+                                  height: 14,
+                                  decoration: BoxDecoration(
+                                    color: base.withValues(alpha: 0.2 + 0.8 * f),
+                                    borderRadius: const BorderRadius.horizontal(
+                                        right: Radius.circular(4)),
+                                  ),
+                                ),
+                              ),
+                            ),
+                    ),
+                  ],
+                ),
+              ),
+              if (tag != null)
+                Positioned(
+                  left: tagLeft,
+                  bottom: rowH - 3,
+                  child: _tag(tag, arrowAlign, tagW),
+                ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _chart(BuildContext context, Map<String, dynamic> d) {
+    final rows = (d['rows'] as List)
+        .map((e) => [(e[0] as num).toDouble(), (e[1] as num).toDouble()])
+        .toList();
+    rows.sort((a, b) => b[0].compareTo(a[0]));
+    final res = (d['res'] as num?)?.toDouble();
+    final sup = (d['sup'] as num?)?.toDouble();
+    final cur = model.price;
+    final items = <Widget>[];
+    var priceDone = cur == null;
+    for (final r in rows) {
+      if (!priceDone && r[0] < cur!) {
+        items.add(_priceRow(context, cur));
+        priceDone = true;
+      }
+      final isRes = res != null && (r[0] - res).abs() < 1e-6;
+      final isSup = sup != null && (r[0] - sup).abs() < 1e-6;
+      items.add(_barRow(
+        context,
+        level: r[0],
+        frac: r[1],
+        above: cur != null && r[0] > cur,
+        tag: isRes ? '最强阻力位' : (isSup ? '最强支撑位' : null),
+      ));
+    }
+    if (!priceDone && cur != null) items.add(_priceRow(context, cur));
+    return Padding(
+      padding: const EdgeInsets.only(top: 36),
+      child: Column(children: items),
+    );
+  }
+
+  Widget _content(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final grey = scheme.onSurfaceVariant;
+    final d = model.current;
+    final win = _srMinutes[model.idx];
+    final have = (d?['have'] as num?)?.toInt() ?? 0;
+    final at = model.at;
+
+    final List<Widget> body;
+    if (d == null || d['ok'] != true) {
+      body = [
+        Text(
+          '数据积累中：已记录 $have 分钟，至少需要 3 分钟才能计算。\n'
+          '价格历史只在 App 后台监控运行期间记录，要看“半天”的结果，需要先持续运行半天。',
+          style: TextStyle(fontSize: 13, color: grey),
+        ),
+      ];
+    } else if (d['flat'] == true) {
+      body = [
+        Text('这段时间价格几乎没有波动，没有可参考的支撑/阻力。',
+            style: TextStyle(fontSize: 13, color: grey)),
+      ];
+    } else {
+      body = [
+        _summary(context, (d['res'] as num?)?.toDouble(),
+            (d['sup'] as num?)?.toDouble()),
+        _chart(context, d),
+        const SizedBox(height: 8),
+        Text(
+          '区间最高 ${_fmt((d['hi'] as num).toDouble())}   '
+          '最低 ${_fmt((d['lo'] as num).toDouble())}'
+          '${have < win * 0.9 ? '\n已记录 $have 分钟，不足 $win 分钟，结果仅供参考' : ''}',
+          style: TextStyle(fontSize: 12, color: grey),
+        ),
+      ];
+    }
+
+    return Container(
+      padding: const EdgeInsets.fromLTRB(20, 16, 20, 20),
+      decoration: BoxDecoration(
+        color: scheme.surfaceContainerLow,
+        borderRadius: BorderRadius.circular(32),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Text('价格分布汇总',
+                  style: TextStyle(fontSize: 17, fontWeight: FontWeight.w600)),
+              const Spacer(),
+              if (at != null)
+                Text(
+                  '更新 ${_two(at.hour)}:${_two(at.minute)}:${_two(at.second)}',
+                  style: TextStyle(fontSize: 12, color: grey),
+                ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          _tabs(),
+          const SizedBox(height: 12),
+          ...body,
+          const SizedBox(height: 12),
+          Text(
+            '按本机记录的浙商价格统计：价格停留的密集区 + 反复见顶/见底的位置。'
+            '这是统计参考，不是预测，也不构成投资建议。',
+            style: TextStyle(fontSize: 11, color: grey),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 void main() {
   FlutterForegroundTask.initCommunicationPort();
   runApp(const GoldApp());
@@ -901,13 +1276,8 @@ class _PricePageState extends State<PricePage> with WidgetsBindingObserver {
   // 三个胶囊卡片的顺序（可拖动调整，自动保存）
   List<String> _order = ['zs', 'ldn', 'sr', 'alert'];
 
-  static const List<int> _srMinutes = [30, 60, 240, 720];
-  static const List<String> _srNames = ['30分钟', '1小时', '4小时', '半天'];
-  List<Map<String, dynamic>> _sr = [];
-  DateTime? _srAt;
-  static const Color _srGreen = Color(0xFF3FB58F);
-  static const Color _srRed = Color(0xFFFF4D4F);
-  int _srIdx = 1;
+  // 支撑/阻力的数据放在模型里，主页入口和单独页面共用
+  final SrModel _srModel = SrModel();
 
   bool _running = false;
   bool _notifOk = true;
@@ -1045,6 +1415,7 @@ class _PricePageState extends State<PricePage> with WidgetsBindingObserver {
         _time = DateTime.now();
         _error = null;
       });
+      _srModel.setPrice(_price);
     } else if (type == 'error') {
       setState(() => _error = data['msg']?.toString());
     } else if (type == 'ldn') {
@@ -1063,10 +1434,8 @@ class _PricePageState extends State<PricePage> with WidgetsBindingObserver {
     } else if (type == 'sr') {
       try {
         final list = jsonDecode(data['json'].toString()) as List;
-        setState(() {
-          _sr = list.map((e) => Map<String, dynamic>.from(e as Map)).toList();
-          _srAt = DateTime.now();
-        });
+        setState(() => _srModel.setData(
+            list.map((e) => Map<String, dynamic>.from(e as Map)).toList()));
       } catch (_) {}
     } else if (type == 'ldnError') {
       setState(() => _ldnError = data['msg']?.toString());
@@ -1094,7 +1463,7 @@ class _PricePageState extends State<PricePage> with WidgetsBindingObserver {
     final idx = await _prefs.getInt('sr_idx');
     if (!mounted) return;
     setState(() {
-      if (idx != null && idx >= 0 && idx < _srMinutes.length) _srIdx = idx;
+      if (idx != null && idx >= 0 && idx < _srMinutes.length) _srModel.setIdx(idx);
       if (saved != null) {
         const valid = ['zs', 'ldn', 'sr', 'alert'];
         final seen = <String>{};
@@ -1478,332 +1847,74 @@ class _PricePageState extends State<PricePage> with WidgetsBindingObserver {
     );
   }
 
-  // 参考京东金融“黄金盯盘”：上方的价位（阻力）用绿色，下方的价位（支撑）用红色
-  Widget _srTabs() {
-    return Row(
-      children: [
-        for (var i = 0; i < _srNames.length; i++)
-          Expanded(
-            child: Padding(
-              padding: EdgeInsets.only(right: i < _srNames.length - 1 ? 8 : 0),
-              child: GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onTap: () {
-                  setState(() => _srIdx = i);
-                  _prefs.setInt('sr_idx', i);
-                },
-                child: Container(
-                  height: 38,
-                  alignment: Alignment.center,
-                  decoration: BoxDecoration(
-                    color: _srIdx == i
-                        ? const Color(0xFFFDEEDB)
-                        : const Color(0xFFF1F2F6),
-                    borderRadius: BorderRadius.circular(22),
-                  ),
-                  child: Text(
-                    _srNames[i],
-                    style: TextStyle(
-                      fontSize: 14,
-                      fontWeight:
-                          _srIdx == i ? FontWeight.w600 : FontWeight.normal,
-                      color: _srIdx == i
-                          ? const Color(0xFFD9822B)
-                          : const Color(0xFF555A66),
-                    ),
-                  ),
-                ),
-              ),
-            ),
-          ),
-      ],
+  // 主页上的“支撑/阻力”只保留一个简短入口，点开进入单独页面
+  void _openSr() {
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => SrPage(model: _srModel, prefs: _prefs),
+      ),
     );
   }
 
-  Widget _srSummary(double? res, double? sup) {
+  Widget _srEntry() {
     final grey = Theme.of(context).colorScheme.onSurfaceVariant;
-    final cur = _price;
-    String dist(double? v) {
-      if (v == null || cur == null || cur == 0) return '';
-      final d = v - cur;
-      return '${d >= 0 ? '+' : ''}${_fmt(d)}（${_pctText(d / cur * 100)}）';
-    }
+    final d = _srModel.current;
+    final name = _srNames[_srModel.idx];
+    final have = (d?['have'] as num?)?.toInt() ?? 0;
 
-    Widget line(String label, double? v, Color c, String tail, String none) {
-      return Text.rich(
-        TextSpan(
-          children: v == null
-              ? [TextSpan(text: '$label：$none')]
-              : [
-                  TextSpan(text: '$label：'),
-                  TextSpan(
-                    text: _fmt(v),
-                    style: TextStyle(color: c, fontWeight: FontWeight.w600),
-                  ),
-                  TextSpan(text: '，$tail'),
-                ],
+    Widget cell(String label, double? v, Color c) {
+      return Expanded(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(label, style: TextStyle(fontSize: 12, color: grey)),
+            const SizedBox(height: 2),
+            Text(
+              v == null ? '--' : _fmt(v),
+              style: TextStyle(
+                  fontSize: 26, fontWeight: FontWeight.bold, color: c),
+            ),
+          ],
         ),
-        style: const TextStyle(fontSize: 14, height: 1.6),
       );
     }
 
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
-      decoration: BoxDecoration(
-        color: Theme.of(context).colorScheme.surface,
-        borderRadius: BorderRadius.circular(18),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+    final Widget summary;
+    if (d == null || d['ok'] != true) {
+      summary = Text('数据积累中：已记录 $have 分钟（至少 3 分钟）',
+          style: TextStyle(fontSize: 13, color: grey));
+    } else if (d['flat'] == true) {
+      summary = Text('这段时间价格几乎没有波动',
+          style: TextStyle(fontSize: 13, color: grey));
+    } else {
+      summary = Row(
         children: [
-          line('最强阻力位', res, _srGreen, '上涨至该价位将明显受阻', '现价已在区间上沿，暂无明显阻力'),
-          line('最强支撑位', sup, _srRed, '下跌至此将获得较强支撑', '现价已在区间下沿，暂无明显支撑'),
-          if (res != null || sup != null) ...[
+          cell('最强阻力 · $name', (d['res'] as num?)?.toDouble(), _srGreen),
+          cell('最强支撑 · $name', (d['sup'] as num?)?.toDouble(), _srRed),
+        ],
+      );
+    }
+
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: _openSr,
+      child: SizedBox(
+        width: double.infinity,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
             const SizedBox(height: 4),
-            Text(
-              '距现价：阻力 ${dist(res).isEmpty ? '--' : dist(res)}   '
-              '支撑 ${dist(sup).isEmpty ? '--' : dist(sup)}',
-              style: TextStyle(fontSize: 12, color: grey),
+            summary,
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Text('查看分布图和其他时间段',
+                    style: TextStyle(fontSize: 12, color: grey)),
+                Icon(Icons.chevron_right, size: 18, color: grey),
+              ],
             ),
           ],
-        ],
-      ),
-    );
-  }
-
-  Widget _srPriceRow(double cur) {
-    final scheme = Theme.of(context).colorScheme;
-    return SizedBox(
-      height: 22,
-      child: Row(
-        children: [
-          SizedBox(
-            width: 60,
-            child: Text(
-              _fmt(cur),
-              style: TextStyle(
-                  fontSize: 13,
-                  fontWeight: FontWeight.bold,
-                  color: scheme.onSurface),
-            ),
-          ),
-          const SizedBox(width: 6),
-          Expanded(
-            child: Container(
-                height: 1.2, color: scheme.onSurface.withValues(alpha: 0.6)),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _srTag(String text, double arrowAlign, double w) {
-    const dark = Color(0xFF3A3B3F);
-    return SizedBox(
-      width: w,
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Container(
-            height: 24,
-            alignment: Alignment.center,
-            decoration: BoxDecoration(
-              color: dark,
-              borderRadius: BorderRadius.circular(6),
-            ),
-            child: Text(text,
-                style: const TextStyle(color: Colors.white, fontSize: 12)),
-          ),
-          Align(
-            alignment: Alignment(arrowAlign, 0),
-            child: const CustomPaint(
-              size: Size(12, 6),
-              painter: _TrianglePainter(dark),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _srBarRow({
-    required double level,
-    required double frac,
-    required bool above,
-    String? tag,
-  }) {
-    const rowH = 20.0;
-    const labelW = 60.0;
-    const tagW = 84.0;
-    final grey = Theme.of(context).colorScheme.onSurfaceVariant;
-    final base = above ? _srGreen : _srRed;
-    final f = frac.clamp(0.0, 1.0).toDouble();
-    return SizedBox(
-      height: rowH,
-      child: LayoutBuilder(
-        builder: (context, c) {
-          final total = c.maxWidth;
-          final barW = total - labelW - 6;
-          final x = labelW + 6 + barW * f;
-          final tagLeft = (x - tagW / 2).clamp(0.0, total - tagW).toDouble();
-          final arrowAlign =
-              (((x - tagLeft) / tagW) * 2 - 1).clamp(-0.85, 0.85).toDouble();
-          return Stack(
-            clipBehavior: Clip.none,
-            children: [
-              Positioned.fill(
-                child: Row(
-                  children: [
-                    SizedBox(
-                      width: labelW,
-                      child: Text(_fmt(level),
-                          style: TextStyle(fontSize: 12.5, color: grey)),
-                    ),
-                    const SizedBox(width: 6),
-                    Expanded(
-                      child: f < 0.04
-                          ? const SizedBox.shrink()
-                          : Align(
-                              alignment: Alignment.centerLeft,
-                              child: FractionallySizedBox(
-                                widthFactor: f,
-                                child: Container(
-                                  height: 13,
-                                  decoration: BoxDecoration(
-                                    color: base.withValues(alpha: 0.2 + 0.8 * f),
-                                    borderRadius: const BorderRadius.horizontal(
-                                        right: Radius.circular(4)),
-                                  ),
-                                ),
-                              ),
-                            ),
-                    ),
-                  ],
-                ),
-              ),
-              if (tag != null)
-                Positioned(
-                  left: tagLeft,
-                  bottom: rowH - 3,
-                  child: _srTag(tag, arrowAlign, tagW),
-                ),
-            ],
-          );
-        },
-      ),
-    );
-  }
-
-  Widget _srChart(Map<String, dynamic> d) {
-    final rows = (d['rows'] as List)
-        .map((e) => [(e[0] as num).toDouble(), (e[1] as num).toDouble()])
-        .toList();
-    rows.sort((a, b) => b[0].compareTo(a[0]));
-    final res = (d['res'] as num?)?.toDouble();
-    final sup = (d['sup'] as num?)?.toDouble();
-    final cur = _price;
-    final items = <Widget>[];
-    var priceDone = cur == null;
-    for (final r in rows) {
-      if (!priceDone && r[0] < cur!) {
-        items.add(_srPriceRow(cur));
-        priceDone = true;
-      }
-      final isRes = res != null && (r[0] - res).abs() < 1e-6;
-      final isSup = sup != null && (r[0] - sup).abs() < 1e-6;
-      items.add(_srBarRow(
-        level: r[0],
-        frac: r[1],
-        above: cur != null && r[0] > cur,
-        tag: isRes ? '最强阻力位' : (isSup ? '最强支撑位' : null),
-      ));
-    }
-    if (!priceDone && cur != null) items.add(_srPriceRow(cur));
-    return Padding(
-      padding: const EdgeInsets.only(top: 34, right: 12),
-      child: Column(children: items),
-    );
-  }
-
-  Widget _srContent() {
-    final grey = Theme.of(context).colorScheme.onSurfaceVariant;
-    final d = _srIdx < _sr.length ? _sr[_srIdx] : null;
-    final win = _srMinutes[_srIdx];
-    final have = (d?['have'] as num?)?.toInt() ?? 0;
-    final at = _srAt;
-
-    final List<Widget> body;
-    if (d == null || d['ok'] != true) {
-      body = [
-        Text(
-          '数据积累中：已记录 $have 分钟，至少需要 3 分钟才能计算。\n'
-          '价格历史只在 App 后台监控运行期间记录，要看“半天”的结果，需要先持续运行半天。',
-          style: TextStyle(fontSize: 13, color: grey),
         ),
-      ];
-    } else if (d['flat'] == true) {
-      body = [
-        Text('这段时间价格几乎没有波动，没有可参考的支撑/阻力。',
-            style: TextStyle(fontSize: 13, color: grey)),
-      ];
-    } else {
-      body = [
-        _srSummary((d['res'] as num?)?.toDouble(), (d['sup'] as num?)?.toDouble()),
-        _srChart(d),
-        const SizedBox(height: 8),
-        Text(
-          '区间最高 ${_fmt((d['hi'] as num).toDouble())}   '
-          '最低 ${_fmt((d['lo'] as num).toDouble())}'
-          '${have < win * 0.9 ? '\n已记录 $have 分钟，不足 $win 分钟，结果仅供参考' : ''}',
-          style: TextStyle(fontSize: 12, color: grey),
-        ),
-      ];
-    }
-
-    return SizedBox(
-      width: double.infinity,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              const Text('价格分布汇总',
-                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
-              const Spacer(),
-              if (at != null)
-                Padding(
-                  padding: const EdgeInsets.only(right: 12),
-                  child: Text(
-                    '更新 ${_two(at.hour)}:${_two(at.minute)}:${_two(at.second)}',
-                    style: TextStyle(fontSize: 12, color: grey),
-                  ),
-                ),
-            ],
-          ),
-          const SizedBox(height: 12),
-          Padding(
-            padding: const EdgeInsets.only(right: 12),
-            child: _srTabs(),
-          ),
-          const SizedBox(height: 12),
-          Padding(
-            padding: const EdgeInsets.only(right: 12),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: body,
-            ),
-          ),
-          const SizedBox(height: 10),
-          Padding(
-            padding: const EdgeInsets.only(right: 12),
-            child: Text(
-              '按本机记录的浙商价格统计：价格停留的密集区 + 反复见顶/见底的位置。'
-              '这是统计参考，不是预测，也不构成投资建议。',
-              style: TextStyle(fontSize: 11, color: grey),
-            ),
-          ),
-        ],
       ),
     );
   }
@@ -1850,7 +1961,7 @@ class _PricePageState extends State<PricePage> with WidgetsBindingObserver {
           key: const ValueKey('sr'),
           index: index,
           title: '支撑 / 阻力 · 浙商 · 元/克',
-          child: _srContent(),
+          child: _srEntry(),
         );
       default:
         return _capsule(
@@ -1868,6 +1979,11 @@ class _PricePageState extends State<PricePage> with WidgetsBindingObserver {
       appBar: AppBar(
         title: const Text('金价'),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.stacked_line_chart),
+            tooltip: '支撑 / 阻力',
+            onPressed: _openSr,
+          ),
           IconButton(
             icon: const Icon(Icons.widgets_outlined),
             tooltip: '添加桌面小组件',
